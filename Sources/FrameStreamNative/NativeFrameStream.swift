@@ -18,6 +18,7 @@
 //
 
 import AVFoundation
+import CoreGraphics
 import CoreVideo
 import Foundation
 
@@ -229,5 +230,57 @@ public enum NativeFrameStream {
                       sourceFrameRate: nominalFrameRate,
                       sourceDuration: duration.seconds,
                       frameCount: outIndex)
+    }
+
+    // MARK: - Decode (frames-in seam for stateful consumers)
+
+    /// Decode every frame of `input` to `CGImage`s in presentation order — the "frames in" seam for
+    /// **stateful** video consumers (object trackers / masklet propagation) that prompt on a chosen
+    /// frame and carry cross-frame memory, where the streaming `run` transform doesn't fit. Reuses the
+    /// same native AVAssetReader → BGRA decode as `run`. Holds all frames in memory (bounded by clip
+    /// length) — intended for short-to-medium clips, not arbitrarily long video. Native containers only.
+    public static func decode(input: URL) async throws -> [CGImage] {
+        try ensureNativeContainer(input)
+        let asset = AVURLAsset(url: input)
+        guard let track = try await asset.loadTracks(withMediaType: .video).first else {
+            throw StreamError.noVideoTrack(input.lastPathComponent)
+        }
+        let reader = try AVAssetReader(asset: asset)
+        let readerOutput = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ])
+        readerOutput.alwaysCopiesSampleData = false
+        guard reader.canAdd(readerOutput) else { throw StreamError.decodeFailed("cannot add reader output") }
+        reader.add(readerOutput)
+        guard reader.startReading() else {
+            throw StreamError.decodeFailed(reader.error?.localizedDescription ?? "startReading")
+        }
+        let cs = CGColorSpaceCreateDeviceRGB()
+        var frames: [CGImage] = []
+        while let sample = readerOutput.copyNextSampleBuffer() {
+            try Task.checkCancellation()
+            guard let pb = CMSampleBufferGetImageBuffer(sample) else { continue }
+            if let cg = cgImage(from: pb, colorSpace: cs) { frames.append(cg) }
+        }
+        if reader.status == .failed {
+            throw StreamError.decodeFailed(reader.error?.localizedDescription ?? "reading")
+        }
+        guard !frames.isEmpty else { throw StreamError.noFramesDecoded }
+        return frames
+    }
+
+    /// Snapshot a 32BGRA `CVPixelBuffer` into an independent `CGImage` (copies the bitmap, so it's
+    /// valid after the buffer is unlocked/recycled). Little-endian BGRA → `noneSkipFirst`.
+    private static func cgImage(from pb: CVPixelBuffer, colorSpace cs: CGColorSpace) -> CGImage? {
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+        let bitmap = CGImageAlphaInfo.noneSkipFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+        guard let ctx = CGContext(data: base, width: w, height: h, bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: cs,
+                                  bitmapInfo: bitmap) else { return nil }
+        return ctx.makeImage()
     }
 }
