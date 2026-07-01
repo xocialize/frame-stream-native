@@ -110,6 +110,27 @@ final class NativeFrameStreamTests: XCTestCase {
         XCTAssertEqual(out.frameCount, 16)
     }
 
+    /// Both encoder paths must write a valid MP4. The default (software) is the stall-proof path
+    /// consumers get for free; `software: false` (hardware) is the documented opt-out.
+    func testSoftwareAndHardwareEncodersBothWrite() async throws {
+        for software in [true, false] {
+            let inURL = try await writeTestVideo(frames: 6, fps: 24, width: 48, height: 32)
+            let outURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
+            defer {
+                try? FileManager.default.removeItem(at: inURL)
+                try? FileManager.default.removeItem(at: outURL)
+            }
+            let out = try await NativeFrameStream.run(input: inURL, output: outURL,
+                                                      timing: .preserveSource,
+                                                      software: software) { [$0] }
+            XCTAssertEqual(out.frameCount, 6, "software=\(software)")
+            let reprobe = try await NativeFrameStream.probe(url: outURL)
+            XCTAssertEqual(reprobe.width, 48, "software=\(software)")
+            XCTAssertEqual(reprobe.height, 32, "software=\(software)")
+        }
+    }
+
     func testNonNativeContainerThrows() async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("webm")

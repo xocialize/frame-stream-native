@@ -45,6 +45,21 @@ let out = try await NativeFrameStream.run(
 `Timing` is `.preserveSource` (keep each source PTS, for 1:1) or `.uniform(fps:)` (re-time output
 index / fps, for N:M). Output is HEVC, always BT.709-tagged.
 
+### Software encode by default (post-MLX stall guard)
+
+`run` encodes with the **software** HEVC encoder by default. The hardware VideoToolbox media engine
+stalls when it encodes right after heavy MLX GPU compute — `isReadyForMoreMediaData` goes false and
+never recovers — which is exactly what these consumers do (RIFE + SeedVR2 encode immediately after
+inference). Software is ~3× slower but reliable. The readiness wait is bounded (~90 s); a genuine
+stall raises `StreamError.encoderStalled` instead of hanging forever.
+
+Opt back into the faster hardware path when you don't encode right after Metal work:
+
+```swift
+try await NativeFrameStream.run(input: input, output: output, software: false) { [$0] }
+// or set the environment: FRAMESTREAM_ENCODE=hardware  (FRAMESTREAM_ENCODE=software forces software)
+```
+
 ## Requirements
 
 macOS 14+. No dependencies beyond AVFoundation / CoreVideo / VideoToolbox.

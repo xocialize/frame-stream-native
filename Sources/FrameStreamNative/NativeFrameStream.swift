@@ -6,6 +6,9 @@
 // decode (AVAssetReader → BGRA) → an async transform that emits ZERO OR MORE output frames per
 // input frame (1:1 upscale/restore, 1:N interpolation) → HEVC encode, always BT.709-tagged.
 // Frames stream one at a time so memory stays bounded; cancellation is checked per source frame.
+// Encode defaults to the SOFTWARE HEVC encoder — the hardware VideoToolbox media engine stalls
+// when it runs right after heavy MLX GPU compute (see `run(software:)`); the readiness wait is
+// bounded so a stall surfaces as `StreamError.encoderStalled`, never an invisible forever-hang.
 //
 // This is a drop-in for format-bridge's `FrameStreamTransform` for the two MLXEngine video
 // consumers (mlx-rife-swift, mlx-seedvr2-swift). The encode/append/timing half is ported
@@ -59,7 +62,15 @@ public enum NativeFrameStream {
         case decodeFailed(String)
         case writeFailed(String)
         case noFramesDecoded
+        /// The video encoder stopped draining (`isReadyForMoreMediaData` stayed false past the
+        /// timeout) — the post-MLX hardware-VideoToolbox stall. Raised instead of hanging forever.
+        case encoderStalled(String)
     }
+
+    /// How long `append` waits for `isReadyForMoreMediaData` before declaring the encoder stalled.
+    /// A real drain resumes in milliseconds; a stall never recovers, so this bounds the "looks like
+    /// a hang" spin-wait into a loud, localized error.
+    private static let encoderStallTimeout: TimeInterval = 90
 
     /// Containers AVFoundation can demux natively. Everything else is normalized upstream.
     private static let nativeExtensions: Set<String> = ["mp4", "mov", "m4v", "qt"]
@@ -102,14 +113,26 @@ public enum NativeFrameStream {
     ///     to consume without emitting (e.g. priming a pairwise window).
     ///   - flush: called once after the last source frame — emit any tail frames (e.g. the
     ///     held `prev` of a pairwise transform).
+    ///   - software: encode with a SOFTWARE-only HEVC encoder (default). The hardware VideoToolbox
+    ///     media engine STALLS when it encodes right after heavy MLX GPU compute —
+    ///     `isReadyForMoreMediaData` goes false and never recovers, which every consumer here does
+    ///     (RIFE + SeedVR2 encode immediately after inference). Software is ~3× slower but reliable.
+    ///     Pass `software: false` — or set `FRAMESTREAM_ENCODE=hardware` — to opt back into the
+    ///     hardware path for callers that don't encode right after Metal work. `FRAMESTREAM_ENCODE=software`
+    ///     forces software regardless of the argument.
     public static func run(
         input: URL,
         output: URL,
         timing: Timing = .preserveSource,
+        software: Bool = true,
         transform: (CVPixelBuffer) async throws -> [CVPixelBuffer],
         flush: () async throws -> [CVPixelBuffer] = { [] }
     ) async throws -> Output {
         try ensureNativeContainer(input)
+
+        // env overrides the param: FRAMESTREAM_ENCODE = "hardware" | "software" | (unset → `software`).
+        let encEnv = ProcessInfo.processInfo.environment["FRAMESTREAM_ENCODE"]
+        let forceSoftware = encEnv == "software" || (encEnv != "hardware" && software)
 
         // Source metadata + decode setup.
         let asset = AVURLAsset(url: input)
@@ -154,7 +177,7 @@ public enum NativeFrameStream {
             if writer == nil {
                 let ow = CVPixelBufferGetWidth(pb), oh = CVPixelBufferGetHeight(pb)
                 let w = try AVAssetWriter(outputURL: output, fileType: .mp4)
-                let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+                var videoSettings: [String: Any] = [
                     AVVideoCodecKey: AVVideoCodecType.hevc,
                     AVVideoWidthKey: ow,
                     AVVideoHeightKey: oh,
@@ -164,7 +187,17 @@ public enum NativeFrameStream {
                         AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
                         AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
                     ],
-                ])
+                ]
+                if forceSoftware {
+                    // VideoToolbox encoder-specification keys in STRING form (no VideoToolbox import
+                    // needed): require a software-only encoder so the hardware media engine — which
+                    // stalls after heavy MLX compute — is never selected.
+                    videoSettings[AVVideoEncoderSpecificationKey] = [
+                        "EnableHardwareAcceleratedVideoEncoder": false,
+                        "RequireSoftwareOnlyVideoEncoder": true,
+                    ] as [String: Any]
+                }
+                let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
                 input.expectsMediaDataInRealTime = false
                 let a = AVAssetWriterInputPixelBufferAdaptor(
                     assetWriterInput: input,
@@ -182,9 +215,25 @@ public enum NativeFrameStream {
             }
             guard let inp = writerInput, let adaptor else { return }
             // Video-only track: a bounded wait for readiness is safe (no cross-track interleave).
+            // Bound it: if the encoder stops draining (`isReadyForMoreMediaData` stuck false — the
+            // post-MLX hardware-VideoToolbox stall) this loop would otherwise spin at ~0% CPU
+            // forever and look like a hang. Time it out into a clear error instead.
+            var waited: TimeInterval = 0
             while !inp.isReadyForMoreMediaData {
                 try await Task.sleep(nanoseconds: 2_000_000)
+                waited += 0.002
                 try Task.checkCancellation()
+                if waited > encoderStallTimeout {
+                    throw StreamError.encoderStalled(
+                        "video encoder not draining at output frame \(outIndex): "
+                        + "isReadyForMoreMediaData=false for \(Int(encoderStallTimeout))s "
+                        + "(\(forceSoftware ? "software" : "hardware") HEVC). "
+                        + (forceSoftware
+                            ? "Unexpected for the software encoder — check for a downstream deadlock."
+                            : "This is the hardware-VideoToolbox stall after heavy MLX compute; "
+                              + "encode with the default software path (drop software:false / "
+                              + "unset FRAMESTREAM_ENCODE=hardware)."))
+                }
             }
             let t: CMTime
             if let d = uniformDuration {
