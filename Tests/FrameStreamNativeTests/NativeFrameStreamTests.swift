@@ -131,6 +131,56 @@ final class NativeFrameStreamTests: XCTestCase {
         }
     }
 
+    /// The timed variant preserves the SOURCE clock for a buffering N:M transform: frames held in
+    /// a window and emitted later (some only at flush) come out with their own recorded PTS, in
+    /// order — not collapsed onto the triggering frame's timestamp or the uniform fallback.
+    func testTimedTransformPreservesSourcePTSAcrossBuffering() async throws {
+        let fps = 24, frames = 10, window = 4
+        let inURL = try await writeTestVideo(frames: frames, fps: fps, width: 48, height: 32)
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).appendingPathExtension("mp4")
+        defer {
+            try? FileManager.default.removeItem(at: inURL)
+            try? FileManager.default.removeItem(at: outURL)
+        }
+
+        var held: [(CVPixelBuffer, CMTime)] = []
+        let out = try await NativeFrameStream.run(
+            input: inURL, output: outURL, timing: .preserveSource,
+            timedTransform: { frame, pts in
+                held.append((frame, pts))
+                guard held.count == window else { return [] }
+                defer { held.removeAll() }
+                return held
+            },
+            timedFlush: {
+                defer { held.removeAll() }
+                return held
+            })
+        XCTAssertEqual(out.frameCount, frames)
+
+        // Read the written PTS back through a DECODING reader output — presentation order.
+        // (A compressed pass-through read returns B-frame decode order plus encoder-delay
+        // filler samples with invalid PTS, which is a property of the HEVC bitstream layout,
+        // not of the timing this test pins.)
+        let asset = AVURLAsset(url: outURL)
+        let track = try await asset.loadTracks(withMediaType: .video).first!
+        let reader = try AVAssetReader(asset: asset)
+        let ro = AVAssetReaderTrackOutput(track: track, outputSettings: [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+        ])
+        reader.add(ro)
+        XCTAssertTrue(reader.startReading())
+        var pts: [Double] = []
+        while let s = ro.copyNextSampleBuffer() {
+            pts.append(CMSampleBufferGetPresentationTimeStamp(s).seconds)
+        }
+        XCTAssertEqual(pts.count, frames)
+        for (i, t) in pts.enumerated() {
+            XCTAssertEqual(t, Double(i) / Double(fps), accuracy: 1e-6, "frame \(i) PTS")
+        }
+    }
+
     func testNonNativeContainerThrows() async throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString).appendingPathExtension("webm")

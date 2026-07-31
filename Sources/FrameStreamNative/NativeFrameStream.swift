@@ -128,6 +128,38 @@ public enum NativeFrameStream {
         transform: (CVPixelBuffer) async throws -> [CVPixelBuffer],
         flush: () async throws -> [CVPixelBuffer] = { [] }
     ) async throws -> Output {
+        // Delegate to the timed variant: every frame emitted from one transform call inherits the
+        // triggering source frame's PTS — exactly the pre-0.4.0 behaviour, byte-for-byte.
+        try await run(input: input, output: output, timing: timing, software: software,
+                      timedTransform: { frame, pts in
+                          try await transform(frame).map { ($0, pts) }
+                      },
+                      timedFlush: {
+                          try await flush().map { ($0, .invalid) }
+                      })
+    }
+
+    /// Timed variant of `run` for **buffering** N:M transforms.
+    ///
+    /// The plain `run` stamps every frame emitted from one transform call with the *triggering*
+    /// source frame's PTS. That is correct for 1:1 transforms, but a transform that buffers a
+    /// window of frames and emits them later (e.g. a temporal-chunked video model) would collapse
+    /// a whole window onto one timestamp — and its flush-emitted tail onto the uniform fallback.
+    ///
+    /// Here the transform receives each source frame's PTS alongside the frame, and returns each
+    /// output frame **paired with the PTS it should carry** — record the PTS on the way in, hand
+    /// it back on the way out, and `timing: .preserveSource` preserves the source clock exactly
+    /// even though emission is deferred. Under `.uniform` the returned PTS is ignored (output
+    /// index / fps, as ever). An `.invalid` PTS falls back to index/nominal-fps, matching the
+    /// plain flush path.
+    public static func run(
+        input: URL,
+        output: URL,
+        timing: Timing = .preserveSource,
+        software: Bool = true,
+        timedTransform: (CVPixelBuffer, CMTime) async throws -> [(CVPixelBuffer, CMTime)],
+        timedFlush: () async throws -> [(CVPixelBuffer, CMTime)] = { [] }
+    ) async throws -> Output {
         try ensureNativeContainer(input)
 
         // env overrides the param: FRAMESTREAM_ENCODE = "hardware" | "software" | (unset → `software`).
@@ -255,15 +287,15 @@ public enum NativeFrameStream {
             try Task.checkCancellation()
             guard let frame = CMSampleBufferGetImageBuffer(sample) else { continue }
             let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-            for out in try await transform(frame) {
-                try await append(out, sourcePTS: pts)
+            for (out, outPTS) in try await timedTransform(frame, pts) {
+                try await append(out, sourcePTS: outPTS)
             }
         }
         if reader.status == .failed {
             throw StreamError.decodeFailed(reader.error?.localizedDescription ?? "reading")
         }
-        for out in try await flush() {
-            try await append(out, sourcePTS: .invalid)
+        for (out, outPTS) in try await timedFlush() {
+            try await append(out, sourcePTS: outPTS)
         }
 
         guard let writer, let writerInput else {
